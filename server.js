@@ -68,7 +68,7 @@ app.post('/create-checkout-session', async (req, res) => {
       currency: 'usd',
       line_items: lineItems,
       return_url: 'https://www.mexicotravelpass.com/success.html?session_id={CHECKOUT_SESSION_ID}',
-      automatic_payment_methods: { enabled: true },
+      payment_method_types: ['card', 'link'],
       locale: 'en',
       metadata: {
         source: 'mexico-travel-pass-website'
