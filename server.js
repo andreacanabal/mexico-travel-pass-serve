@@ -65,9 +65,11 @@ app.post('/create-checkout-session', async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       ui_mode: 'embedded',
       mode: 'payment',
+      currency: 'usd',
       line_items: lineItems,
       return_url: 'https://www.mexicotravelpass.com/success.html?session_id={CHECKOUT_SESSION_ID}',
       payment_method_types: ['card'],
+      locale: 'en',
       metadata: {
         source: 'mexico-travel-pass-website'
       }
