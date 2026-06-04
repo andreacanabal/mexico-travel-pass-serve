@@ -97,12 +97,43 @@ app.get('/verify-session', async (req, res) => {
       expand: ['line_items']
     });
 
-    // Only return what the frontend needs — don't leak sensitive data
+    // Map purchased items to guide URLs
+    const GUIDE_URLS = {
+      'price_1TdNCsDOZDPnW2siWVL9vVD0': 'https://www.mexicotravelpass.com/cdmx-guide-2026',
+      'price_1TdNG7DOZDPnW2siLBlEzzgU': 'https://www.mexicotravelpass.com/GDL-guide-2026',
+      'price_1TdNQoDOZDPnW2si1vWVaxCl': 'https://www.mexicotravelpass.com/MTY-guide-2026',
+      'price_1TdNGgDOZDPnW2siSyprCW9U': 'https://www.mexicotravelpass.com/all3-guide-2026',
+      'price_1TdNH3DOZDPnW2si4Gp5veqZ': 'https://www.mexicotravelpass.com/cdmx_stomach-2026',
+      'price_1TdNHSDOZDPnW2sitXBu5imr': 'https://www.mexicotravelpass.com/GDL_stomach-2026',
+      'price_1TdNHpDOZDPnW2siGXCpM5us': 'https://www.mexicotravelpass.com/MTY_stomach-2026',
+      'price_1TdNIlDOZDPnW2sisp9Jr4no': 'https://www.mexicotravelpass.com/All3_stomach-2026',
+    };
+
+    const purchasedPriceIds = session.line_items.data.map(i => i.price.id);
+    const guideUrls = purchasedPriceIds
+      .map(id => GUIDE_URLS[id])
+      .filter(Boolean);
+
+    // If bought 3 individual city guides, redirect to all3
+    const cityGuides = ['price_1TdNCsDOZDPnW2siWVL9vVD0','price_1TdNG7DOZDPnW2siLBlEzzgU','price_1TdNQoDOZDPnW2si1vWVaxCl'];
+    const boughtAllThree = cityGuides.every(id => purchasedPriceIds.includes(id));
+    if (boughtAllThree) {
+      const allIdx = guideUrls.indexOf('https://www.mexicotravelpass.com/cdmx-guide-2026');
+      // Replace individual city URLs with all3
+      guideUrls.length = 0;
+      guideUrls.push('https://www.mexicotravelpass.com/all3-guide-2026');
+    }
+
+    // Primary guide = first non-stomach guide, or first guide
+    const primaryGuide = guideUrls.find(u => !u.includes('stomach')) || guideUrls[0];
+
     res.json({
-      status:       session.status,         // 'complete' | 'expired' | 'open'
-      amount_total: session.amount_total,   // in cents — e.g. 2299
-      currency:     session.currency,       // 'usd'
-      line_items:   session.line_items.data // array of purchased items
+      status:        session.status,
+      amount_total:  session.amount_total,
+      currency:      session.currency,
+      line_items:    session.line_items.data,
+      guide_urls:    guideUrls,        // all guides purchased
+      primary_guide: primaryGuide,     // main redirect URL
     });
 
   } catch (err) {
