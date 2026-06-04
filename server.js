@@ -186,6 +186,41 @@ app.get('/verify-session', async (req, res) => {
   }
 });
 
+
+// ── ENDPOINT 3: Capture Lead (email gate → Brevo list 3) ──
+app.post('/capture-lead', async (req, res) => {
+  try {
+    const { email, cities } = req.body;
+    if (!email) return res.status(400).json({ error: 'email required' });
+
+    const response = await fetch('https://api.brevo.com/v3/contacts', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'api-key': BREVO_API_KEY
+      },
+      body: JSON.stringify({
+        email,
+        attributes: {
+          CITIES:      cities || 'Unknown',
+          ORDER_VALUE: 0,
+          SOURCE:      'Mexico Travel Pass — Email Gate'
+        },
+        listIds: [3], // identified_contacts → triggers abandon cart automation 2
+        updateEnabled: true
+      })
+    });
+
+    const data = await response.json();
+    console.log(`📧 Lead captured: ${email} — ${cities}`);
+    res.json({ ok: true });
+
+  } catch (err) {
+    console.error('capture-lead error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Health check ───────────────────────────────────────
 app.get('/health', (req, res) => res.json({
   ok: true,
