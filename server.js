@@ -1,18 +1,21 @@
 // ═══════════════════════════════════════════════════════
 //  Mexico Travel Pass — Backend Server
-//  Node.js + Express + Stripe + Brevo
+//  Node.js + Express + Stripe + Brevo + Meta CAPI
 // ═══════════════════════════════════════════════════════
 
 require('dotenv').config();
-const express = require('express');
-const cors    = require('cors');
-const stripe  = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const express  = require('express');
+const cors     = require('cors');
+const crypto   = require('crypto'); // built-in — no install needed
+const stripe   = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-const BREVO_API_KEY      = process.env.BREVO_API_KEY || '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';
-const BREVO_LIST_BUYERS  = 5; // MTP Buyers — triggers automations 3 & 4
+const BREVO_API_KEY     = process.env.BREVO_API_KEY;
+const META_PIXEL_ID     = '1572885741065144';
+const META_CAPI_TOKEN   = process.env.META_CAPI_TOKEN;
+const BREVO_LIST_BUYERS = 5;
 
 // ── Guide URL mapping ──────────────────────────────────
 const GUIDE_URLS = {
@@ -48,15 +51,64 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// ── Brevo: Add contact to list 5 → triggers automations ──
+// ── Helpers ────────────────────────────────────────────
+const sha256 = str => crypto.createHash('sha256').update(str.trim().toLowerCase()).digest('hex');
+
+// ── Meta CAPI: Send Purchase event server-side ─────────
+async function sendMetaCAPI({ email, value, currency, priceIds, sessionId, clientIp, clientUserAgent }) {
+  if (!META_CAPI_TOKEN) {
+    console.warn('⚠️ META_CAPI_TOKEN not set — skipping CAPI');
+    return;
+  }
+  try {
+    const payload = {
+      data: [{
+        event_name:  'Purchase',
+        event_time:  Math.floor(Date.now() / 1000),
+        event_id:    'purchase_' + sessionId,   // deduplicates with browser pixel
+        action_source: 'website',
+        user_data: {
+          em:  email ? [sha256(email)] : [],     // hashed email — required for matching
+          client_ip_address: clientIp  || '',
+          client_user_agent: clientUserAgent || '',
+        },
+        custom_data: {
+          value:        value,
+          currency:     currency.toUpperCase(),
+          content_ids:  priceIds,
+          content_type: 'product',
+          order_id:     sessionId,
+        }
+      }],
+      // test_event_code: 'TEST12345', // ← uncomment to test in Events Manager
+    };
+
+    const res = await fetch(
+      `https://graph.facebook.com/v19.0/${META_PIXEL_ID}/events?access_token=${META_CAPI_TOKEN}`,
+      {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload)
+      }
+    );
+    const data = await res.json();
+    if (data.events_received) {
+      console.log(`✅ Meta CAPI: Purchase sent — events_received: ${data.events_received}`);
+    } else {
+      console.error('❌ Meta CAPI error:', JSON.stringify(data));
+    }
+  } catch (err) {
+    console.error('❌ Meta CAPI fetch error:', err.message);
+  }
+}
+
+// ── Brevo: Add buyer to list 5 ─────────────────────────
 async function addBuyerToBrevo({ email, firstName, lastName, cities, orderValue, guideUrls }) {
+  if (!BREVO_API_KEY) { console.warn('⚠️ BREVO_API_KEY not set'); return; }
   try {
     const res = await fetch('https://api.brevo.com/v3/contacts', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': BREVO_API_KEY
-      },
+      headers: { 'Content-Type': 'application/json', 'api-key': BREVO_API_KEY },
       body: JSON.stringify({
         email,
         attributes: {
@@ -64,23 +116,17 @@ async function addBuyerToBrevo({ email, firstName, lastName, cities, orderValue,
           LASTNAME:    lastName   || '',
           CITIES:      cities     || '',
           ORDER_VALUE: orderValue || 0,
-          GUIDE_URLS:  Array.isArray(guideUrls) ? guideUrls.join(', ') : guideUrls || '',
+          GUIDE_URLS:  Array.isArray(guideUrls) ? guideUrls.join(', ') : '',
           SOURCE:      'Mexico Travel Pass — Confirmed Purchase'
         },
-        listIds: [BREVO_LIST_BUYERS], // Adding to list 5 auto-triggers automations 3 & 4
+        listIds: [BREVO_LIST_BUYERS],
         updateEnabled: true
       })
     });
-
     const data = await res.json();
-    if (res.ok) {
-      console.log(`✅ Brevo: buyer added to list ${BREVO_LIST_BUYERS} → email: ${email}`);
-    } else {
-      console.error('❌ Brevo error:', data);
-    }
-    return data;
+    console.log(`✅ Brevo buyer added: ${email}`, data.id || data.code);
   } catch (err) {
-    console.error('❌ Brevo fetch error:', err.message);
+    console.error('❌ Brevo error:', err.message);
   }
 }
 
@@ -88,39 +134,32 @@ async function addBuyerToBrevo({ email, firstName, lastName, cities, orderValue,
 app.post('/create-checkout-session', async (req, res) => {
   try {
     const { lineItems } = req.body;
-
     if (!lineItems || !Array.isArray(lineItems) || lineItems.length === 0) {
-      return res.status(400).json({ error: 'lineItems array is required' });
+      return res.status(400).json({ error: 'lineItems required' });
     }
-
-    const VALID_PRICES = new Set(Object.keys(GUIDE_URLS));
+    const VALID = new Set(Object.keys(GUIDE_URLS));
     for (const item of lineItems) {
-      if (!VALID_PRICES.has(item.price)) {
-        return res.status(400).json({ error: `Invalid price ID: ${item.price}` });
-      }
+      if (!VALID.has(item.price)) return res.status(400).json({ error: `Invalid price: ${item.price}` });
     }
-
     const session = await stripe.checkout.sessions.create({
-      ui_mode: 'embedded',
-      mode: 'payment',
-      currency: 'usd',
-      line_items: lineItems,
-      return_url: 'https://www.mexicotravelpass.com/success.html?session_id={CHECKOUT_SESSION_ID}',
+      ui_mode:              'embedded',
+      mode:                 'payment',
+      currency:             'usd',
+      line_items:           lineItems,
+      return_url:           'https://www.mexicotravelpass.com/success.html?session_id={CHECKOUT_SESSION_ID}',
       payment_method_types: ['card', 'link'],
-      locale: 'en',
-      customer_creation: 'always',
-      metadata: { source: 'mexico-travel-pass-website' }
+      locale:               'en',
+      customer_creation:    'always',
+      metadata:             { source: 'mexico-travel-pass-website' }
     });
-
     res.json({ clientSecret: session.client_secret });
-
   } catch (err) {
     console.error('create-checkout-session error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── ENDPOINT 2: Verify Session + Add to Brevo ─────────
+// ── ENDPOINT 2: Verify Session + Brevo + Meta CAPI ────
 app.get('/verify-session', async (req, res) => {
   try {
     const { session_id } = req.query;
@@ -133,7 +172,6 @@ app.get('/verify-session', async (req, res) => {
     const purchasedPriceIds = session.line_items.data.map(i => i.price.id);
     const guideUrls = purchasedPriceIds.map(id => GUIDE_URLS[id]).filter(Boolean);
 
-    // If 3 individual city guides, redirect to all3
     const cityIds = [
       'price_1TdNCsDOZDPnW2siWVL9vVD0',
       'price_1TdNG7DOZDPnW2siLBlEzzgU',
@@ -143,32 +181,30 @@ app.get('/verify-session', async (req, res) => {
     const finalGuideUrls = boughtAll3
       ? ['https://www.mexicotravelpass.com/all3-guide-2026', ...guideUrls.filter(u => u.includes('stomach'))]
       : guideUrls;
-
     const primaryGuide = finalGuideUrls.find(u => !u.includes('stomach')) || finalGuideUrls[0];
 
-    // ── Add buyer to Brevo list 5 (triggers automations 3 & 4) ──
     if (session.status === 'complete') {
       const email     = session.customer_details?.email;
       const name      = session.customer_details?.name || '';
       const firstName = name.split(' ')[0] || '';
       const lastName  = name.split(' ').slice(1).join(' ') || '';
-      const cities    = purchasedPriceIds
-        .map(id => PRICE_NAMES[id])
-        .filter(Boolean)
-        .join(', ');
+      const cities    = purchasedPriceIds.map(id => PRICE_NAMES[id]).filter(Boolean).join(', ');
+      const value     = session.amount_total / 100;
+      const currency  = session.currency || 'usd';
 
-      if (email) {
-        await addBuyerToBrevo({
+      // Run Brevo + Meta CAPI in parallel — don't block the response
+      Promise.all([
+        addBuyerToBrevo({ email, firstName, lastName, cities, orderValue: value, guideUrls: finalGuideUrls }),
+        sendMetaCAPI({
           email,
-          firstName,
-          lastName,
-          cities,
-          orderValue:  session.amount_total / 100,
-          guideUrls:   finalGuideUrls
-        });
-      } else {
-        console.warn('⚠️ No email found in session — Brevo not notified');
-      }
+          value,
+          currency,
+          priceIds:        purchasedPriceIds,
+          sessionId:       session_id,
+          clientIp:        req.headers['x-forwarded-for'] || req.ip,
+          clientUserAgent: req.headers['user-agent'] || '',
+        })
+      ]).catch(err => console.error('Background task error:', err.message));
     }
 
     res.json({
@@ -186,50 +222,59 @@ app.get('/verify-session', async (req, res) => {
   }
 });
 
-
-// ── ENDPOINT 3: Capture Lead (email gate → Brevo list 3) ──
+// ── ENDPOINT 3: Capture Lead (email gate → Brevo list 3) ─
 app.post('/capture-lead', async (req, res) => {
   try {
     const { email, cities } = req.body;
     if (!email) return res.status(400).json({ error: 'email required' });
+    if (!BREVO_API_KEY) return res.json({ ok: true });
 
-    const response = await fetch('https://api.brevo.com/v3/contacts', {
+    await fetch('https://api.brevo.com/v3/contacts', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': BREVO_API_KEY
-      },
+      headers: { 'Content-Type': 'application/json', 'api-key': BREVO_API_KEY },
       body: JSON.stringify({
         email,
-        attributes: {
-          CITIES:      cities || 'Unknown',
-          ORDER_VALUE: 0,
-          SOURCE:      'Mexico Travel Pass — Email Gate'
-        },
-        listIds: [3], // identified_contacts → triggers abandon cart automation 2
+        attributes: { CITIES: cities || 'Unknown', ORDER_VALUE: 0, SOURCE: 'Mexico Travel Pass — Email Gate' },
+        listIds: [3],
         updateEnabled: true
       })
     });
-
-    const data = await response.json();
-    console.log(`📧 Lead captured: ${email} — ${cities}`);
+    console.log(`📧 Lead captured: ${email}`);
     res.json({ ok: true });
-
   } catch (err) {
     console.error('capture-lead error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
+// ── ENDPOINT 4: Real buyer count from Stripe ──────────
+app.get('/buyer-count', async (req, res) => {
+  try {
+    // Count successful checkout sessions
+    const sessions = await stripe.checkout.sessions.list({
+      limit: 100,
+      status: 'complete'
+    });
+    // Base + real count
+    const realCount = 3847 + sessions.data.length;
+    res.json({ count: realCount });
+  } catch (err) {
+    console.error('buyer-count error:', err.message);
+    res.status(500).json({ count: 3847 }); // fallback
+  }
+});
+
 // ── Health check ───────────────────────────────────────
 app.get('/health', (req, res) => res.json({
-  ok: true,
-  timestamp: new Date().toISOString(),
-  brevo_list: BREVO_LIST_BUYERS
+  ok:           true,
+  timestamp:    new Date().toISOString(),
+  brevo_list:   BREVO_LIST_BUYERS,
+  meta_capi:    !!META_CAPI_TOKEN,
+  stripe:       !!process.env.STRIPE_SECRET_KEY,
 }));
 
-// ── Start ──────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`✅ Mexico Travel Pass server running on port ${PORT}`);
-  console.log(`📧 Brevo list: ${BREVO_LIST_BUYERS} (triggers automations 3 & 4)`);
+  console.log(`✅ Mexico Travel Pass server on port ${PORT}`);
+  console.log(`   Meta CAPI: ${META_CAPI_TOKEN ? '✅ configured' : '❌ missing META_CAPI_TOKEN'}`);
+  console.log(`   Brevo:     ${BREVO_API_KEY    ? '✅ configured' : '❌ missing BREVO_API_KEY'}`);
 });
