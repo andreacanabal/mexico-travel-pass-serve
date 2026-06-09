@@ -41,14 +41,14 @@ const PRICE_NAMES = {
 };
 
 // ── Middleware ──────────────────────────────────────────
-app.use(cors({
-  origin: [
-    'https://www.mexicotravelpass.com',
-    'https://mexicotravelpass.com',
-    'http://localhost:8080',
-    'http://127.0.0.1:5500'
-  ]
-}));
+// CORS — allow all origins (tighten after launch)
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 app.use(express.json());
 
 // ── Helpers ────────────────────────────────────────────
@@ -105,6 +105,7 @@ async function sendMetaCAPI({ email, value, currency, priceIds, sessionId, clien
 // ── Brevo: Add buyer to list 5 ─────────────────────────
 async function addBuyerToBrevo({ email, firstName, lastName, cities, orderValue, guideUrls }) {
   if (!BREVO_API_KEY) { console.warn('⚠️ BREVO_API_KEY not set'); return; }
+  console.log(`📧 Adding to Brevo list ${BREVO_LIST_BUYERS}: ${email}`);
   try {
     const res = await fetch('https://api.brevo.com/v3/contacts', {
       method: 'POST',
@@ -192,19 +193,27 @@ app.get('/verify-session', async (req, res) => {
       const value     = session.amount_total / 100;
       const currency  = session.currency || 'usd';
 
-      // Run Brevo + Meta CAPI in parallel — don't block the response
-      Promise.all([
-        addBuyerToBrevo({ email, firstName, lastName, cities, orderValue: value, guideUrls: finalGuideUrls }),
+      // Log what we have
+      console.log(`📦 Purchase verified: ${email || 'NO EMAIL'} — ${cities} — $${value}`);
+
+      if (!email) {
+        console.error('❌ No email in session — cannot add to Brevo');
+      } else {
+        // Add to Brevo immediately (not in background) so we can log errors
+        try {
+          await addBuyerToBrevo({ email, firstName, lastName, cities, orderValue: value, guideUrls: finalGuideUrls });
+        } catch (err) {
+          console.error('❌ Brevo failed:', err.message);
+        }
+        // Meta CAPI in background
         sendMetaCAPI({
-          email,
-          value,
-          currency,
+          email, value, currency,
           priceIds:        purchasedPriceIds,
           sessionId:       session_id,
           clientIp:        req.headers['x-forwarded-for'] || req.ip,
           clientUserAgent: req.headers['user-agent'] || '',
-        })
-      ]).catch(err => console.error('Background task error:', err.message));
+        }).catch(err => console.error('Meta CAPI error:', err.message));
+      }
     }
 
     res.json({
